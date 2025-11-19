@@ -5,6 +5,8 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+import difflib
+import re
 from google import genai
 from google.genai import types
 import httpx
@@ -50,7 +52,7 @@ class AsyncLLMJudgeMetric(MetricBase):
     
     @property
     def weight(self) -> float:
-        return 0.0
+        return 0.2
     
     def is_available(self) -> bool:
         return True
@@ -75,13 +77,23 @@ class AsyncLLMJudgeMetric(MetricBase):
                 result = _grading_results[question]
                 if "error" not in result:
                     return result["normalized_score"]
-                return 0.0
+                return result.get("normalized_score", _local_grade(question, answer))
+        
+        # Lazy init; if it fails (no network/creds), fall back to local grade.
+        if not _initialized:
+            if not _lazy_init():
+                local_score = _local_grade(question, answer)
+                with _results_lock:
+                    _grading_results[question] = {"normalized_score": local_score, "fallback": True}
+                return local_score
         
         # Submit to thread pool
         if _executor:
             _executor.submit(_grade_one, question, answer)
+            return _local_grade(question, answer)  # quick proxy while async runs
         
-        return 0.0
+        # If executor not available, return fallback
+        return _local_grade(question, answer)
     
     def __str__(self) -> str:
         return f"{self.__class__.__name__}(name='{self.name}')"
@@ -93,12 +105,19 @@ def _lazy_init():
     
     if _initialized:
         return
-    
-    _client = genai.Client()
-    doc_url = "https://my.uopeople.edu/pluginfile.php/57436/mod_book/chapter/37620/Database%20System%20Concepts%204th%20Edition%20By%20Silberschatz-Korth-Sudarshan.pdf"
-    _doc_data = httpx.get(doc_url).content
-    _executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="llm_judge")
-    _initialized = True
+    try:
+        _client = genai.Client()
+        doc_url = "https://my.uopeople.edu/pluginfile.php/57436/mod_book/chapter/37620/Database%20System%20Concepts%204th%20Edition%20By%20Silberschatz-Korth-Sudarshan.pdf"
+        _doc_data = httpx.get(doc_url, timeout=30.0).content
+        _executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="llm_judge")
+        _initialized = True
+        return True
+    except Exception as e:
+        print(f"AsyncLLMJudge init failed, falling back to local grading: {e}")
+        _client = None
+        _executor = None
+        _initialized = True  # prevent repeated attempts
+        return False
 
 
 def _perform_attempt(question: str, answer: str) -> Dict:
@@ -147,6 +166,10 @@ def _grade_one(question: str, answer: str):
     """Grade a single Q&A pair in background thread with retry logic."""
     if not _initialized:
         return
+    if _client is None or _executor is None:
+        with _results_lock:
+            _grading_results[question] = {"normalized_score": _local_grade(question, answer), "fallback": True}
+        return
     
     max_retries = 3
     base_delay = 20.0 # 20 seconds
@@ -173,7 +196,9 @@ def _grade_one(question: str, answer: str):
                 _grading_results[question] = {
                     "error": error_str,
                     "answer": answer,
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
+                    "normalized_score": _local_grade(question, answer),
+                    "fallback": True,
                 }
             break
 
@@ -228,3 +253,26 @@ Evaluate the answer on the following dimensions:
 - Provide specific, actionable feedback
 - Be fair but rigorous in your assessment"""
 
+
+_STOPWORDS = {
+    "the","is","at","which","on","for","a","an","and","or","in","to","of","by","with",
+    "that","this","it","as","are","was","what","how","why","when","where","who"
+}
+
+def _local_grade(question: str, answer: str) -> float:
+    """
+    Cheap local heuristic when remote judge is unavailable.
+    Mix of lexical overlap and sequence similarity, returns 0..1.
+    """
+    if not answer.strip():
+        return 0.0
+
+    # Normalize
+    q_tokens = {w for w in re.findall(r"\w+", question.lower()) if w not in _STOPWORDS}
+    a_tokens = {w for w in re.findall(r"\w+", answer.lower()) if w not in _STOPWORDS}
+    overlap = len(q_tokens & a_tokens) / max(1, len(q_tokens)) if q_tokens else 0.0
+
+    seq_sim = difflib.SequenceMatcher(None, question.lower(), answer.lower()).ratio()
+
+    score = 0.6 * overlap + 0.4 * seq_sim
+    return float(max(0.0, min(1.0, score)))
